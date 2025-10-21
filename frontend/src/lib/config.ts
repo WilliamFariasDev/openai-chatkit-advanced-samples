@@ -3,6 +3,9 @@ import { StartScreenPrompt } from "@openai/chatkit";
 export const CHATKIT_API_URL =
   import.meta.env.VITE_CHATKIT_API_URL ?? "/chatkit";
 
+export const UPLOAD_API_URL =
+  import.meta.env.VITE_UPLOAD_API_URL ?? "/api/uploads/direct";
+
 /**
  * ChatKit still expects a domain key at runtime. Use any placeholder locally,
  * but register your production domain at

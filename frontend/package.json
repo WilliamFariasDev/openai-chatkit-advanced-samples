@@ -21,6 +21,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^8.57.1",
+    "@openai/chatkit": "^1.0.0",
     "@types/node": "^24.5.2",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",

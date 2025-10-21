@@ -453,8 +453,56 @@ class PostgresStoreSimplified(Store[dict[str, Any]]):
         attachment_id: str,
         context: dict[str, Any],
     ) -> Attachment:
-        raise NotImplementedError("Attachment support not yet implemented")
+        """Load attachment metadata from database."""
+        from chatkit.types import FileAttachment, ImageAttachment
+
+        user_id = self._get_user_id(context)
+        pool = await get_db_pool()
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, filename, byte_size, mime, openai_file_id, created_at
+                FROM public.uploads
+                WHERE id = $1 AND user_id = $2
+                """,
+                attachment_id,
+                user_id,
+            )
+
+            if not row:
+                raise NotFoundError(f"Attachment {attachment_id} not found")
+
+            # Create appropriate attachment type based on mime type
+            if row["mime"].startswith("image/"):
+                return ImageAttachment(
+                    id=str(row["id"]),
+                    thread_id="",  # Thread ID is not stored in uploads table
+                    created_at=row["created_at"],
+                    mime_type=row["mime"],
+                    name=row["filename"],
+                    size_bytes=row["byte_size"],
+                    preview_url=None,
+                )
+            else:
+                return FileAttachment(
+                    id=str(row["id"]),
+                    thread_id="",  # Thread ID is not stored in uploads table
+                    created_at=row["created_at"],
+                    mime_type=row["mime"],
+                    name=row["filename"],
+                    size_bytes=row["byte_size"],
+                )
 
     async def delete_attachment(self, attachment_id: str, context: dict[str, Any]) -> None:
-        raise NotImplementedError("Attachment support not yet implemented")
+        """Delete attachment from database."""
+        user_id = self._get_user_id(context)
+        pool = await get_db_pool()
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM public.uploads WHERE id = $1 AND user_id = $2",
+                attachment_id,
+                user_id,
+            )
 

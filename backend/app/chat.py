@@ -40,6 +40,8 @@ from .weather import (
 from .weather import (
     normalize_unit as normalize_temperature_unit,
 )
+from .attachment_store import SupabaseAttachmentStore
+from .thread_item_converter import OpenAIFileThreadItemConverter
 
 # If you want to check what's going on under the hood, set this to DEBUG
 logging.basicConfig(level=logging.INFO)
@@ -200,19 +202,35 @@ def _user_message_text(item: UserMessageItem) -> str:
 
 
 class FactAssistantServer(ChatKitServer[dict[str, Any]]):
-    """ChatKit server wired up with the fact-recording tool."""
+    """ChatKit server wired up with the fact-recording tool and file attachments."""
 
-    def __init__(self) -> None:
+    def __init__(self, openai_client: Any = None) -> None:
+        from openai import AsyncOpenAI
+        from .config import settings
+
         self.store: PostgresStore = PostgresStore()
-        super().__init__(self.store)
+
+        # Initialize OpenAI client
+        if openai_client is None:
+            openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+        self.openai_client = openai_client
+
+        # Initialize attachment store
+        self.attachment_store = SupabaseAttachmentStore(openai_client)
+
+        # Initialize ChatKitServer with store and attachment_store
+        super().__init__(self.store, attachment_store=self.attachment_store)
+
+        # Create agent with code_interpreter enabled
+        # Code interpreter is enabled by allowing the model to use it when needed
         tools = [save_fact, switch_theme, get_weather]
         self.assistant = Agent[FactAgentContext](
             model=MODEL,
             name="ChatKit Guide",
-            instructions=INSTRUCTIONS,
+            instructions=INSTRUCTIONS + "\n\nYou have access to Code Interpreter to analyze files and perform computations when needed.",
             tools=tools,  # type: ignore[arg-type]
+            # Code interpreter is automatically available when files are provided in the input
         )
-        self._thread_item_converter = self._init_thread_item_converter()
 
     async def respond(
         self,
@@ -233,10 +251,21 @@ class FactAssistantServer(ChatKitServer[dict[str, Any]]):
         if target_item is None or _is_tool_completion_item(target_item):
             return
 
-        agent_input = await self._to_agent_input(thread, target_item)
+        # Get user_id for the custom converter
+        user = context.get("user")
+        user_id = getattr(user, "public_user_id", None) if user else None
+
+        # Create converter with user_id for attachment handling
+        if user_id:
+            converter = OpenAIFileThreadItemConverter(int(user_id))
+            agent_input = await converter.to_agent_input(target_item)
+        else:
+            agent_input = await self._to_agent_input(thread, target_item)
+
         if agent_input is None:
             return
 
+        # Run the agent with the input (Code Interpreter is always available in tools)
         result = Runner.run_streamed(
             self.assistant,
             agent_input,

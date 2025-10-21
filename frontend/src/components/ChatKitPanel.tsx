@@ -7,6 +7,7 @@ import {
   PLACEHOLDER_INPUT,
   GREETING,
   SUPABASE_TOKEN,
+  UPLOAD_API_URL,
 } from "../lib/config";
 import type { FactAction } from "../hooks/useFacts";
 import type { ColorScheme } from "../hooks/useColorScheme";
@@ -46,6 +47,10 @@ export function ChatKitPanel({
       url: CHATKIT_API_URL,
       domainKey: CHATKIT_API_DOMAIN_KEY,
       fetch: customFetch,
+      uploadStrategy: {
+        type: 'direct',
+        uploadUrl: UPLOAD_API_URL,
+      },
     },
     theme: {
       colorScheme: theme,
@@ -68,6 +73,15 @@ export function ChatKitPanel({
     },
     composer: {
       placeholder: PLACEHOLDER_INPUT,
+      attachments: {
+          enabled: true,
+        maxSize: 10 * 1024 * 1024, // 10MB per file
+        maxCount: 5,
+        accept: {
+          "image/*": [".png", ".jpg", ".jpeg", ".gif", ".webp"],
+          "application/pdf": [".pdf"],
+        },
+      },
     },
     threadItemActions: {
       feedback: false,
