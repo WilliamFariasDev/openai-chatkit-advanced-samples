@@ -247,7 +247,13 @@ class FactAssistantServer(ChatKitServer[dict[str, Any]]):
         return
 
     async def to_message_content(self, _input: Attachment) -> ResponseInputContentParam:
-        raise RuntimeError("File attachments are not supported in this demo.")
+        # Handle image attachments by returning image_url content
+        if hasattr(_input, 'url') and _input.url:
+            return {"type": "image_url", "image_url": {"url": _input.url}}
+        elif hasattr(_input, 'file_id') and _input.file_id:
+            return {"type": "file", "file_id": _input.file_id}
+        else:
+            raise RuntimeError("File attachments are not supported in this demo.")
 
     def _init_thread_item_converter(self) -> Any | None:
         converter_cls = ThreadItemConverter
