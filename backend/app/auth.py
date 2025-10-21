@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from .database import get_user_id_from_auth_id
 from .supabase_client import create_supabase_auth_client
 
 security = HTTPBearer()
@@ -15,10 +16,13 @@ security = HTTPBearer()
 class AuthUser:
     """Authenticated user information from Supabase."""
 
-    def __init__(self, user_id: str, email: str | None, raw: dict):
+    def __init__(
+        self, user_id: str, email: str | None, raw: dict, public_user_id: int | None = None
+    ):
         self.id = user_id
         self.email = email
         self.raw = raw
+        self.public_user_id = public_user_id
 
 
 async def get_current_user(
@@ -49,12 +53,24 @@ async def get_current_user(
                 detail="Token de autenticação inválido.",
             )
 
+        # Get the public user ID from the database
+        public_user_id = await get_user_id_from_auth_id(user.id)
+
+        if not public_user_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Usuário não encontrado no banco de dados.",
+            )
+
         return AuthUser(
             user_id=user.id,
             email=user.email,
             raw=user.model_dump() if hasattr(user, "model_dump") else dict(user),
+            public_user_id=public_user_id,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -90,10 +106,14 @@ async def get_current_user_optional(
         if not user:
             return None
 
+        # Get the public user ID from the database
+        public_user_id = await get_user_id_from_auth_id(user.id)
+
         return AuthUser(
             user_id=user.id,
             email=user.email,
             raw=user.model_dump() if hasattr(user, "model_dump") else dict(user),
+            public_user_id=public_user_id,
         )
 
     except Exception:

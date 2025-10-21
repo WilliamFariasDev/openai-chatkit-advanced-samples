@@ -31,6 +31,7 @@ from pydantic import ConfigDict, Field
 from .constants import INSTRUCTIONS, MODEL
 from .facts import Fact, fact_store
 from .memory_store import MemoryStore
+from .postgres_store_simplified import PostgresStoreSimplified as PostgresStore
 from .sample_widget import render_weather_widget, weather_widget_copy_text
 from .weather import (
     WeatherLookupError,
@@ -68,7 +69,7 @@ def _is_tool_completion_item(item: Any) -> bool:
 
 class FactAgentContext(AgentContext):
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    store: Annotated[MemoryStore, Field(exclude=True)]
+    store: Annotated[PostgresStore, Field(exclude=True)]
     request_context: dict[str, Any]
 
 
@@ -202,7 +203,7 @@ class FactAssistantServer(ChatKitServer[dict[str, Any]]):
     """ChatKit server wired up with the fact-recording tool."""
 
     def __init__(self) -> None:
-        self.store: MemoryStore = MemoryStore()
+        self.store: PostgresStore = PostgresStore()
         super().__init__(self.store)
         tools = [save_fact, switch_theme, get_weather]
         self.assistant = Agent[FactAgentContext](

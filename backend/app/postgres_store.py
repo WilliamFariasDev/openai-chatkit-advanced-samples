@@ -1,0 +1,597 @@
+"""PostgreSQL-based implementation of ChatKit Store interface."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime
+from typing import Any
+
+from pydantic import TypeAdapter
+from chatkit.store import NotFoundError, Store
+from chatkit.types import Attachment, Page, Thread, ThreadItem, ThreadMetadata
+
+from .database import get_db_pool
+
+
+# TypeAdapter for converting dictionaries to ThreadItem objects
+_thread_item_adapter = TypeAdapter(ThreadItem)
+
+
+class DictWithAttributeAccess(dict):
+    """Dictionary subclass that allows attribute-style access to items."""
+    def __getattr__(self, key: str) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{key}'")
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        self[key] = value
+
+
+def _serialize_for_json(obj: Any) -> Any:
+    """Recursively convert datetime objects to ISO format strings for JSON serialization."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, dict):
+        return {key: _serialize_for_json(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [_serialize_for_json(item) for item in obj]
+    return obj
+
+
+class PostgresStore(Store[dict[str, Any]]):
+    """PostgreSQL store compatible with the ChatKit server interface.
+
+    Stores threads and messages in the same schema used by backend-service-nodejs.
+    Uses openai_conversation_id to store ChatKit thread IDs while the database UUID
+    is auto-generated. Requires user_id to be passed in the context for all operations.
+    """
+
+    @staticmethod
+    def _coerce_thread_metadata(thread: ThreadMetadata | Thread) -> ThreadMetadata:
+        """Return thread metadata without any embedded items."""
+        has_items = isinstance(thread, Thread) or "items" in getattr(
+            thread, "model_fields_set", set()
+        )
+        if not has_items:
+            return thread.model_copy(deep=True)
+
+        data = thread.model_dump()
+        data.pop("items", None)
+        return ThreadMetadata(**data).model_copy(deep=True)
+
+    @staticmethod
+    def _get_user_id(context: dict[str, Any]) -> int:
+        """Extract user_id from context. Raises if not found."""
+        user = context.get("user")
+        if not user:
+            raise ValueError("user_id is required in context")
+
+        user_id = getattr(user, "public_user_id", None)
+        if user_id is None:
+            raise ValueError("public_user_id is required in user context")
+
+        return int(user_id)
+
+    # -- Thread metadata -------------------------------------------------
+    async def load_thread(self, thread_id: str, context: dict[str, Any]) -> ThreadMetadata:
+        """Load thread by openai_conversation_id (ChatKit thread ID)."""
+        user_id = self._get_user_id(context)
+        pool = await get_db_pool()
+
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, user_id, title, metadata, created_at, updated_at, openai_conversation_id
+                FROM public.threads
+                WHERE openai_conversation_id = $1 AND user_id = $2
+                """,
+                thread_id,
+                user_id,
+            )
+
+            if not row:
+                raise NotFoundError(f"Thread {thread_id} not found")
+
+            return ThreadMetadata(
+                id=thread_id,  # Return the ChatKit thread ID
+                created_at=row["created_at"],
+                title=row["title"],
+                metadata=json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {}),
+            )
+
+    async def save_thread(self, thread: ThreadMetadata, context: dict[str, Any]) -> None:
+        """Save thread using openai_conversation_id (ChatKit thread ID)."""
+        user_id = self._get_user_id(context)
+        metadata = self._coerce_thread_metadata(thread)
+        pool = await get_db_pool()
+
+        async with pool.acquire() as conn:
+            # Check if thread exists by openai_conversation_id
+            existing = await conn.fetchrow(
+                "SELECT id FROM public.threads WHERE openai_conversation_id = $1 AND user_id = $2",
+                thread.id,
+                user_id,
+            )
+
+            if existing:
+                # Update existing thread
+                await conn.execute(
+                    """
+                    UPDATE public.threads
+                    SET title = $1, metadata = $2, updated_at = $3
+                    WHERE openai_conversation_id = $4 AND user_id = $5
+                    """,
+                    metadata.title,
+                    json.dumps(metadata.metadata or {}),
+                    datetime.now(),
+                    thread.id,
+                    user_id,
+                )
+            else:
+                # Insert new thread (id will be auto-generated by database)
+                await conn.execute(
+                    """
+                    INSERT INTO public.threads (user_id, openai_conversation_id, title, metadata, created_at, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    """,
+                    user_id,
+                    thread.id,  # Store ChatKit thread ID in openai_conversation_id
+                    metadata.title,
+                    json.dumps(metadata.metadata or {}),
+                    datetime.now(),
+                    datetime.now(),
+                )
+
+    async def load_threads(
+        self,
+        limit: int,
+        after: str | None,
+        order: str,
+        context: dict[str, Any],
+    ) -> Page[ThreadMetadata]:
+        user_id = self._get_user_id(context)
+        pool = await get_db_pool()
+
+        order_clause = "DESC" if order == "desc" else "ASC"
+
+        async with pool.acquire() as conn:
+            # Build query with pagination
+            if after:
+                # Get the created_at of the 'after' thread by openai_conversation_id
+                after_row = await conn.fetchrow(
+                    "SELECT created_at FROM public.threads WHERE openai_conversation_id = $1",
+                    after,
+                )
+                if not after_row:
+                    rows = []
+                else:
+                    after_time = after_row["created_at"]
+                    if order == "desc":
+                        rows = await conn.fetch(
+                            f"""
+                            SELECT id, user_id, title, metadata, created_at, updated_at, openai_conversation_id
+                            FROM public.threads
+                            WHERE user_id = $1 AND created_at < $2
+                            ORDER BY created_at {order_clause}
+                            LIMIT $3
+                            """,
+                            user_id,
+                            after_time,
+                            limit + 1,
+                        )
+                    else:
+                        rows = await conn.fetch(
+                            f"""
+                            SELECT id, user_id, title, metadata, created_at, updated_at, openai_conversation_id
+                            FROM public.threads
+                            WHERE user_id = $1 AND created_at > $2
+                            ORDER BY created_at {order_clause}
+                            LIMIT $3
+                            """,
+                            user_id,
+                            after_time,
+                            limit + 1,
+                        )
+            else:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT id, user_id, title, metadata, created_at, updated_at, openai_conversation_id
+                    FROM public.threads
+                    WHERE user_id = $1
+                    ORDER BY created_at {order_clause}
+                    LIMIT $2
+                    """,
+                    user_id,
+                    limit + 1,
+                )
+
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+
+            threads = [
+                ThreadMetadata(
+                    id=row["openai_conversation_id"] or str(row["id"]),  # Use openai_conversation_id as ID
+                    created_at=row["created_at"],
+                    title=row["title"],
+                    metadata=json.loads(row["metadata"]) if isinstance(row["metadata"], str) else (row["metadata"] or {}),
+                )
+                for row in rows
+            ]
+
+            next_after = threads[-1].id if has_more and threads else None
+            return Page(data=threads, has_more=has_more, after=next_after)
+
+    async def delete_thread(self, thread_id: str, context: dict[str, Any]) -> None:
+        user_id = self._get_user_id(context)
+        pool = await get_db_pool()
+
+        async with pool.acquire() as conn:
+            # Get the database UUID for this thread
+            thread_row = await conn.fetchrow(
+                "SELECT id FROM public.threads WHERE openai_conversation_id = $1 AND user_id = $2",
+                thread_id,
+                user_id,
+            )
+
+            if not thread_row:
+                return  # Thread not found, nothing to delete
+
+            db_thread_id = thread_row["id"]
+
+            # Delete messages first (foreign key constraint)
+            await conn.execute(
+                """
+                DELETE FROM public.messages
+                WHERE thread_id = $1
+                """,
+                db_thread_id,
+            )
+
+            # Delete thread
+            await conn.execute(
+                """
+                DELETE FROM public.threads
+                WHERE id = $1
+                """,
+                db_thread_id,
+            )
+
+    # -- Thread items ----------------------------------------------------
+    async def load_thread_items(
+        self,
+        thread_id: str,
+        after: str | None,
+        limit: int,
+        order: str,
+        context: dict[str, Any],
+    ) -> Page[ThreadItem]:
+        pool = await get_db_pool()
+        order_clause = "DESC" if order == "desc" else "ASC"
+
+        async with pool.acquire() as conn:
+            # Verify thread belongs to user and get database UUID
+            user_id = self._get_user_id(context)
+            thread_row = await conn.fetchrow(
+                "SELECT id FROM public.threads WHERE openai_conversation_id = $1 AND user_id = $2",
+                thread_id,
+                user_id,
+            )
+            if not thread_row:
+                raise NotFoundError(f"Thread {thread_id} not found")
+
+            db_thread_id = thread_row["id"]
+
+            # Build query with pagination
+            if after:
+                after_row = await conn.fetchrow(
+                    "SELECT created_at FROM public.messages WHERE openai_message_id = $1",
+                    after,
+                )
+                if not after_row:
+                    rows = []
+                else:
+                    after_time = after_row["created_at"]
+                    if order == "desc":
+                        rows = await conn.fetch(
+                            f"""
+                            SELECT id, thread_id, role, content, raw, created_at, updated_at, openai_message_id
+                            FROM public.messages
+                            WHERE thread_id = $1 AND created_at < $2
+                            ORDER BY created_at {order_clause}
+                            LIMIT $3
+                            """,
+                            db_thread_id,
+                            after_time,
+                            limit + 1,
+                        )
+                    else:
+                        rows = await conn.fetch(
+                            f"""
+                            SELECT id, thread_id, role, content, raw, created_at, updated_at, openai_message_id
+                            FROM public.messages
+                            WHERE thread_id = $1 AND created_at > $2
+                            ORDER BY created_at {order_clause}
+                            LIMIT $3
+                            """,
+                            db_thread_id,
+                            after_time,
+                            limit + 1,
+                        )
+            else:
+                rows = await conn.fetch(
+                    f"""
+                    SELECT id, thread_id, role, content, raw, created_at, updated_at, openai_message_id
+                    FROM public.messages
+                    WHERE thread_id = $1
+                    ORDER BY created_at {order_clause}
+                    LIMIT $2
+                    """,
+                    db_thread_id,
+                    limit + 1,
+                )
+
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+
+            # Convert rows to ThreadItem
+            items = []
+            for row in rows:
+                # Parse the raw JSON data if it's a string
+                if isinstance(row["raw"], str):
+                    raw_data = json.loads(row["raw"])
+                elif isinstance(row["raw"], dict):
+                    raw_data = row["raw"]
+                else:
+                    raw_data = {}
+
+                # Use the full raw data as the base (which contains all ThreadItem fields)
+                # Then override key fields to ensure consistency
+                message_id = row.get("openai_message_id") or str(row["id"])
+                item_data = {
+                    **raw_data,
+                    "id": message_id,
+                    "thread_id": thread_id,  # Return the ChatKit thread ID
+                    "created_at": row["created_at"].isoformat() if isinstance(row["created_at"], datetime) else row["created_at"],
+                }
+
+                # Convert dict to proper ThreadItem Pydantic object
+                thread_item = _thread_item_adapter.validate_python(item_data)
+
+                # Debug logging
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(f"LOAD_THREAD_ITEMS - Thread: {thread_id}, Item ID: {message_id}, Type: {thread_item.type}, Item class: {type(thread_item).__name__}")
+
+                items.append(thread_item)
+
+            # Log summary
+            if items:
+                logger.info(f"LOAD_THREAD_ITEMS - Total items loaded: {len(items)}, Last item type: {items[-1].type}, Last item class: {type(items[-1]).__name__}")
+
+            next_after = items[-1].id if has_more and items else None
+            return Page(data=items, has_more=has_more, after=next_after)
+
+    async def add_thread_item(
+        self, thread_id: str, item: ThreadItem, context: dict[str, Any]
+    ) -> None:
+        pool = await get_db_pool()
+        user_id = self._get_user_id(context)
+
+        async with pool.acquire() as conn:
+            # Get database UUID for thread
+            thread_row = await conn.fetchrow(
+                "SELECT id FROM public.threads WHERE openai_conversation_id = $1 AND user_id = $2",
+                thread_id,
+                user_id,
+            )
+            if not thread_row:
+                raise NotFoundError(f"Thread {thread_id} not found")
+
+            db_thread_id = thread_row["id"]
+
+            # Extract item data
+            item_dict = item.model_dump() if hasattr(item, "model_dump") else dict(item)
+
+            # Debug logging
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"ADD_THREAD_ITEM - Thread: {thread_id}, Item ID: {item_dict.get('id')}, Type: {item_dict.get('type')}, Role: {item_dict.get('role')}")
+            logger.debug(f"ADD_THREAD_ITEM - Full item data: {json.dumps(item_dict, default=str)}")
+
+            # Only extract role if it exists (some items like client_tool_call don't have role)
+            role = item_dict.get("role", None)
+            content_data = item_dict.get("content", [])
+
+            # Extract text content
+            if isinstance(content_data, list):
+                text_parts = [
+                    part.get("text", "") for part in content_data if part.get("type") == "text"
+                ]
+                content = " ".join(text_parts)
+            elif isinstance(content_data, str):
+                content = content_data
+            else:
+                content = str(content_data) if content_data else ""
+
+            await conn.execute(
+                """
+                INSERT INTO public.messages
+                (thread_id, role, content, raw, created_at, updated_at, openai_message_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                db_thread_id,
+                role,  # Can be NULL for items that don't have role
+                content,
+                json.dumps(_serialize_for_json(item_dict)),
+                item_dict.get("created_at", datetime.now()),
+                datetime.now(),
+                item.id,  # Use ChatKit item ID as openai_message_id
+            )
+
+    async def save_item(self, thread_id: str, item: ThreadItem, context: dict[str, Any]) -> None:
+        pool = await get_db_pool()
+        user_id = self._get_user_id(context)
+
+        async with pool.acquire() as conn:
+            # Get database UUID for thread
+            thread_row = await conn.fetchrow(
+                "SELECT id FROM public.threads WHERE openai_conversation_id = $1 AND user_id = $2",
+                thread_id,
+                user_id,
+            )
+            if not thread_row:
+                raise NotFoundError(f"Thread {thread_id} not found")
+
+            db_thread_id = thread_row["id"]
+
+            # Check if message exists by openai_message_id
+            existing = await conn.fetchrow(
+                "SELECT id FROM public.messages WHERE openai_message_id = $1 AND thread_id = $2",
+                item.id,
+                db_thread_id,
+            )
+
+            item_dict = item.model_dump() if hasattr(item, "model_dump") else dict(item)
+
+            # Only extract role if it exists (some items like client_tool_call don't have role)
+            role = item_dict.get("role", None)
+            content_data = item_dict.get("content", [])
+
+            if isinstance(content_data, list):
+                text_parts = [
+                    part.get("text", "") for part in content_data if part.get("type") == "text"
+                ]
+                content = " ".join(text_parts)
+            elif isinstance(content_data, str):
+                content = content_data
+            else:
+                content = str(content_data) if content_data else ""
+
+            if existing:
+                await conn.execute(
+                    """
+                    UPDATE public.messages
+                    SET role = $1, content = $2, raw = $3, updated_at = $4
+                    WHERE id = $5
+                    """,
+                    role,
+                    content,
+                    json.dumps(_serialize_for_json(item_dict)),
+                    datetime.now(),
+                    existing["id"],
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO public.messages
+                    (thread_id, role, content, raw, created_at, updated_at, openai_message_id)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    """,
+                    db_thread_id,
+                    role,
+                    content,
+                    json.dumps(_serialize_for_json(item_dict)),
+                    item_dict.get("created_at", datetime.now()),
+                    datetime.now(),
+                    item.id,
+                )
+
+    async def load_item(self, thread_id: str, item_id: str, context: dict[str, Any]) -> ThreadItem:
+        pool = await get_db_pool()
+        user_id = self._get_user_id(context)
+
+        async with pool.acquire() as conn:
+            # Get database UUID for thread
+            thread_row = await conn.fetchrow(
+                "SELECT id FROM public.threads WHERE openai_conversation_id = $1 AND user_id = $2",
+                thread_id,
+                user_id,
+            )
+            if not thread_row:
+                raise NotFoundError(f"Thread {thread_id} not found")
+
+            db_thread_id = thread_row["id"]
+
+            row = await conn.fetchrow(
+                """
+                SELECT id, thread_id, role, content, raw, created_at, updated_at, openai_message_id
+                FROM public.messages
+                WHERE openai_message_id = $1 AND thread_id = $2
+                """,
+                item_id,
+                db_thread_id,
+            )
+
+            if not row:
+                raise NotFoundError(f"Item {item_id} not found")
+
+            # Parse the raw JSON data if it's a string
+            if isinstance(row["raw"], str):
+                raw_data = json.loads(row["raw"])
+            elif isinstance(row["raw"], dict):
+                raw_data = row["raw"]
+            else:
+                raw_data = {}
+
+            # Use the full raw data as the base (which contains all ThreadItem fields)
+            # Then override key fields to ensure consistency
+            message_id = row.get("openai_message_id") or str(row["id"])
+            item_data = {
+                **raw_data,
+                "id": message_id,
+                "thread_id": thread_id,  # Return ChatKit thread ID
+                "created_at": row["created_at"].isoformat() if isinstance(row["created_at"], datetime) else row["created_at"],
+            }
+
+            # Convert dict to proper ThreadItem Pydantic object
+            thread_item = _thread_item_adapter.validate_python(item_data)
+            return thread_item
+
+    async def delete_thread_item(
+        self, thread_id: str, item_id: str, context: dict[str, Any]
+    ) -> None:
+        pool = await get_db_pool()
+        user_id = self._get_user_id(context)
+
+        async with pool.acquire() as conn:
+            # Get database UUID for thread
+            thread_row = await conn.fetchrow(
+                "SELECT id FROM public.threads WHERE openai_conversation_id = $1 AND user_id = $2",
+                thread_id,
+                user_id,
+            )
+            if not thread_row:
+                return  # Thread not found, nothing to delete
+
+            db_thread_id = thread_row["id"]
+
+            await conn.execute(
+                """
+                DELETE FROM public.messages
+                WHERE openai_message_id = $1 AND thread_id = $2
+                """,
+                item_id,
+                db_thread_id,
+            )
+
+    # -- Files -----------------------------------------------------------
+    async def save_attachment(
+        self,
+        attachment: Attachment,
+        context: dict[str, Any],
+    ) -> None:
+        # Could be implemented using the uploads table
+        raise NotImplementedError("Attachment support not yet implemented")
+
+    async def load_attachment(
+        self,
+        attachment_id: str,
+        context: dict[str, Any],
+    ) -> Attachment:
+        raise NotImplementedError("Attachment support not yet implemented")
+
+    async def delete_attachment(self, attachment_id: str, context: dict[str, Any]) -> None:
+        raise NotImplementedError("Attachment support not yet implemented")
+
