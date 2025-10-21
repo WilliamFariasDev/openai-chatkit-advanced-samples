@@ -1,0 +1,8 @@
+[project]
+name = "openai-chatkit-advanced-samples"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "supabase>=2.22.0",
+]

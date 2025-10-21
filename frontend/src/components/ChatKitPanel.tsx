@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useRef, useMemo } from "react";
 import { ChatKit, useChatKit } from "@openai/chatkit-react";
 import {
   CHATKIT_API_URL,
@@ -6,6 +6,7 @@ import {
   STARTER_PROMPTS,
   PLACEHOLDER_INPUT,
   GREETING,
+  SUPABASE_TOKEN,
 } from "../lib/config";
 import type { FactAction } from "../hooks/useFacts";
 import type { ColorScheme } from "../hooks/useColorScheme";
@@ -25,8 +26,27 @@ export function ChatKitPanel({
 }: ChatKitPanelProps) {
   const processedFacts = useRef(new Set<string>());
 
+  // Custom fetch function that adds the Authorization header
+  const customFetch = useMemo(() => {
+    return async (url: string, options?: RequestInit) => {
+      const headers = new Headers(options?.headers);
+      if (SUPABASE_TOKEN) {
+        headers.set("Authorization", `Bearer ${SUPABASE_TOKEN}`);
+      }
+
+      return fetch(url, {
+        ...options,
+        headers,
+      });
+    };
+  }, []);
+
   const chatkit = useChatKit({
-    api: { url: CHATKIT_API_URL, domainKey: CHATKIT_API_DOMAIN_KEY },
+    api: {
+      url: CHATKIT_API_URL,
+      domainKey: CHATKIT_API_DOMAIN_KEY,
+      fetch: customFetch,
+    },
     theme: {
       colorScheme: theme,
       color: {

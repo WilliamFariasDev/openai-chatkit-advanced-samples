@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from chatkit.server import StreamingResult
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import Response, StreamingResponse
 from starlette.responses import JSONResponse
 
+from .auth import AuthUser, get_current_user
 from .chat import (
     FactAssistantServer,
     create_chatkit_server,
@@ -34,10 +35,12 @@ def get_chatkit_server() -> FactAssistantServer:
 
 @app.post("/chatkit")
 async def chatkit_endpoint(
-    request: Request, server: FactAssistantServer = Depends(get_chatkit_server)
+    request: Request,
+    server: FactAssistantServer = Depends(get_chatkit_server),
+    current_user: AuthUser = Depends(get_current_user),
 ) -> Response:
     payload = await request.body()
-    result = await server.process(payload, {"request": request})
+    result = await server.process(payload, {"request": request, "user": current_user})
     if isinstance(result, StreamingResult):
         return StreamingResponse(result, media_type="text/event-stream")
     if hasattr(result, "json"):
@@ -46,13 +49,18 @@ async def chatkit_endpoint(
 
 
 @app.get("/facts")
-async def list_facts() -> dict[str, Any]:
+async def list_facts(
+    current_user: Annotated[AuthUser, Depends(get_current_user)],
+) -> dict[str, Any]:
     facts = await fact_store.list_saved()
     return {"facts": [fact.as_dict() for fact in facts]}
 
 
 @app.post("/facts/{fact_id}/save")
-async def save_fact(fact_id: str) -> dict[str, Any]:
+async def save_fact(
+    fact_id: str,
+    current_user: Annotated[AuthUser, Depends(get_current_user)],
+) -> dict[str, Any]:
     fact = await fact_store.mark_saved(fact_id)
     if fact is None:
         raise HTTPException(status_code=404, detail="Fact not found")
@@ -60,7 +68,10 @@ async def save_fact(fact_id: str) -> dict[str, Any]:
 
 
 @app.post("/facts/{fact_id}/discard")
-async def discard_fact(fact_id: str) -> dict[str, Any]:
+async def discard_fact(
+    fact_id: str,
+    current_user: Annotated[AuthUser, Depends(get_current_user)],
+) -> dict[str, Any]:
     fact = await fact_store.discard(fact_id)
     if fact is None:
         raise HTTPException(status_code=404, detail="Fact not found")
